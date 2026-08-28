@@ -19,23 +19,21 @@
 # SOFTWARE.
 
 param(
-    [int]$RetryCount = 3,      # Number of full download retry rounds
-    [switch]$UseProxyFirst     # When specified, proxy URLs are tried first
+    [switch]$UseProxyFirst,
+    [switch]$NoProxy
 )
 
-# ==================== Version definition ====================
-$Version = "2026/8/27"
+$Version = "2026/8/28 - Release"
 
-# ==================== Banner and usage hints ====================
 Write-Host "Linodas Card Harvester Builder" -ForegroundColor Cyan
 Write-Host "by 42 (ans_42@tuta.io)" -ForegroundColor Cyan
 Write-Host "World of Linodas" -ForegroundColor Cyan
 Write-Host "www.linodas.com" -ForegroundColor Cyan
 Write-Host "by Lyragosa" -ForegroundColor Cyan
 Write-Host ""
-Write-Host "Usage: .\build.ps1 [-UseProxyFirst] [-RetryCount <n>]" -ForegroundColor Yellow
+Write-Host "Usage: .\LinodasCardHarvesterBuilder.ps1 [-UseProxyFirst] [-NoProxy]" -ForegroundColor Yellow
 Write-Host "  -UseProxyFirst    Prefer proxy downloads over direct links." -ForegroundColor Yellow
-Write-Host "  -RetryCount <n>   Number of download retry rounds (default: 3)." -ForegroundColor Yellow
+Write-Host "  -NoProxy          Disable all proxy URLs (overrides -UseProxyFirst)." -ForegroundColor Yellow
 Write-Host ""
 
 $ErrorActionPreference = "Stop"
@@ -47,16 +45,27 @@ $ProgressPreference = "SilentlyContinue"
 $RootDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 Set-Location $RootDir
 
-$ToolsDir   = Join-Path $RootDir "tools"
-$Aria2Dir   = Join-Path $ToolsDir "aria2"
-$MingwDir   = Join-Path $ToolsDir "mingw64"
-$CurlDir    = Join-Path $ToolsDir "curl"
-$IncludeDir = Join-Path $RootDir "include"
+$ToolsDir    = Join-Path $RootDir "tools"
+$DownloadDir = Join-Path $RootDir "download"
+$Aria2Dir    = Join-Path $ToolsDir "aria2"
+$MingwDir    = Join-Path $ToolsDir "mingw64"
+$CurlDir     = Join-Path $ToolsDir "curl"
+$IncludeDir  = Join-Path $RootDir "include"
+$SevenZipDir = Join-Path $ToolsDir "7zip"
 
-foreach ($dir in @($ToolsDir, $Aria2Dir, $MingwDir, $CurlDir, $IncludeDir)) {
+foreach ($dir in @($ToolsDir, $Aria2Dir, $MingwDir, $CurlDir, $DownloadDir, $IncludeDir, $SevenZipDir)) {
     if (-not (Test-Path $dir)) {
         New-Item -ItemType Directory -Path $dir -Force | Out-Null
     }
+}
+
+$hashTable = @{
+    "aria2-1.37.0-win-64bit-build1.zip" = "6D78405DA9CF5639DBE8174787002161B8124D73880FB57CC8C0A3A63982F84E46DF4E626990C58F23452965AD925F0D37CB9147E99B25C3D7CA0EA49602F34D"
+    "winlibs-x86_64-posix-seh-gcc-16.2.0-mingw-w64ucrt-14.0.0-r1.zip" = "23AC519702CC8ECB9481EF45CBCEF6938F286AE01AC69E56FE346AA6A31A99AAA5AEFCD73C8041B2944985DB855B20D42B1BEA06F5C837AAC4FBB3EDDA1DC2A1"
+    "curl-8.21.0_7-win64-mingw.zip" = "A0C7903849F4EA4C9465E478451AD09053719B7D9739DE3B1869A040E6DC6E1FECD15FE7959114AC14C637DEF85BE9CCE6B3292FAC43E2012E73714A1FF27243"
+    "json.hpp" = "DA77FA48CA883DACF5CE147B2354E9D957AD66EDF72A7103FF5A8611C5CDA77B64F1F0CA60491295574EE158CECCCFE7797CD36FAAC5B47E75687400AC60769D"
+    "7zr.exe" = "DFDCF16EDB65BADDD43181C9481A2C9453B0C678A6825108C2AB4CB30DE34497C5FDA5639721B3CED9CB4B98744FB6DAB7314BD49685385C365425B721B19279"
+    "7z2602-extra.7z" = "612D54AF5793BD7A43DE8871481DC5658B0781F91E5A464F2ECE75A3654C326CDAB5CE51B5CA3930FA71EBFDF0F1846323D1F5A206F99855DF9EAEB56E285398"
 }
 
 function Test-FileValid {
@@ -66,6 +75,13 @@ function Test-FileValid {
         if ($item -and -not $item.PSIsContainer -and $item.Length -ge $MinSize) { return $true }
     }
     return $false
+}
+
+function Test-Hash {
+    param([string]$Path, [string]$ExpectedHash)
+    if (-not (Test-Path $Path)) { return $false }
+    $actual = (Get-FileHash -Path $Path -Algorithm SHA512).Hash
+    return ($actual -eq $ExpectedHash)
 }
 
 function Invoke-CurlDownload {
@@ -112,52 +128,88 @@ function Download-WithFallback {
     param(
         [string[]]$Urls,
         [string]$OutputPath,
+        [string]$ExpectedHash,
         [switch]$UseAria2,
         [switch]$PreferProxy,
-        [int]$RetryCount = 3
+        [int]$MaxRetries = 5,
+        [switch]$InfiniteRetry
     )
     if (Test-FileValid $OutputPath) {
-        Write-Host "  Already exists, skipping: $OutputPath" -ForegroundColor Yellow
-        return $true
+        Write-Host "  Already exists, verifying hash: $OutputPath" -ForegroundColor Yellow
+        if (Test-Hash -Path $OutputPath -ExpectedHash $ExpectedHash) {
+            Write-Host "  Hash verification passed." -ForegroundColor Green
+            return $true
+        } else {
+            Write-Warning "  Hash mismatch for existing file, will re-download."
+            Remove-Item $OutputPath -Force -ErrorAction SilentlyContinue
+        }
     }
 
     $orderedUrls = $Urls
-    if ($PreferProxy) {
+    if ($PreferProxy -and -not $NoProxy) {
         $proxyUrls = @($Urls | Where-Object { $_ -like "*gh-proxy.com*" })
         $directUrls = @($Urls | Where-Object { $_ -notlike "*gh-proxy.com*" })
         $orderedUrls = @($proxyUrls + $directUrls)
+    } elseif ($NoProxy) {
+        $orderedUrls = @($Urls | Where-Object { $_ -notlike "*gh-proxy.com*" })
     }
 
-    for ($attempt = 1; $attempt -le $RetryCount; $attempt++) {
-        Write-Host "  Download attempt $attempt/$RetryCount" -ForegroundColor DarkYellow
+    $attempt = 1
+    while ($InfiniteRetry -or $attempt -le $MaxRetries) {
+        if (-not $InfiniteRetry) {
+            Write-Host "  Download attempt $attempt/$MaxRetries" -ForegroundColor DarkYellow
+        } else {
+            Write-Host "  Download attempt $attempt (infinite retry)" -ForegroundColor DarkYellow
+        }
+
         foreach ($url in $orderedUrls) {
             if ($UseAria2) {
                 if (Invoke-Aria2Download -Url $url -OutputPath $OutputPath) {
-                    Write-Host "  Success (aria2c)" -ForegroundColor Green
-                    return $true
+                    if (Test-Hash -Path $OutputPath -ExpectedHash $ExpectedHash) {
+                        Write-Host "  Success (aria2c) with valid hash" -ForegroundColor Green
+                        return $true
+                    } else {
+                        Write-Warning "  Hash mismatch after aria2c download, trying next."
+                        Remove-Item $OutputPath -Force -ErrorAction SilentlyContinue
+                    }
                 }
             }
             if (Invoke-CurlDownload -Url $url -OutputPath $OutputPath) {
-                Write-Host "  Success (curl.exe)" -ForegroundColor Green
-                return $true
+                if (Test-Hash -Path $OutputPath -ExpectedHash $ExpectedHash) {
+                    Write-Host "  Success (curl.exe) with valid hash" -ForegroundColor Green
+                    return $true
+                } else {
+                    Write-Warning "  Hash mismatch after curl download, trying next."
+                    Remove-Item $OutputPath -Force -ErrorAction SilentlyContinue
+                }
             }
             if (Invoke-WebRequestDownload -Url $url -OutputPath $OutputPath) {
-                Write-Host "  Success (Invoke-WebRequest)" -ForegroundColor Green
-                return $true
+                if (Test-Hash -Path $OutputPath -ExpectedHash $ExpectedHash) {
+                    Write-Host "  Success (Invoke-WebRequest) with valid hash" -ForegroundColor Green
+                    return $true
+                } else {
+                    Write-Warning "  Hash mismatch after WebRequest download, trying next."
+                    Remove-Item $OutputPath -Force -ErrorAction SilentlyContinue
+                }
             }
         }
-        if ($attempt -lt $RetryCount) {
-            Write-Host "  All URLs failed in attempt $attempt, retrying..." -ForegroundColor Yellow
+
+        if ($InfiniteRetry) {
+            Write-Host "  All URLs failed in attempt $attempt, retrying indefinitely..." -ForegroundColor Yellow
+            Start-Sleep -Seconds 5
+        } elseif ($attempt -lt $MaxRetries) {
+            Write-Host "  All URLs failed or hash mismatched in attempt $attempt, retrying..." -ForegroundColor Yellow
             Start-Sleep -Seconds 2
         }
+        $attempt++
     }
-    Write-Error "All download attempts failed after $RetryCount retries: $($orderedUrls -join ', ')"
+    Write-Warning "All download attempts failed after $MaxRetries retries: $($orderedUrls -join ', ')"
     return $false
 }
 
 function Expand-ZipSmart {
     param([string]$ZipPath, [string]$DestinationDir, [string]$MarkerPath)
-    Write-Host "  Extracting: $ZipPath -> $DestinationDir" -ForegroundColor Cyan
+    Write-Host "  Extracting (Expand-Archive): $ZipPath -> $DestinationDir" -ForegroundColor Cyan
     $tempExpand = Join-Path $env:TEMP ("expand_" + [guid]::NewGuid().ToString("N"))
     New-Item -ItemType Directory -Path $tempExpand -Force | Out-Null
     try {
@@ -183,10 +235,52 @@ function Expand-ZipSmart {
         }
 
         Copy-Item -Path (Join-Path $sourceDir '*') -Destination $DestinationDir -Recurse -Force
-        Write-Host "  Extraction complete" -ForegroundColor Green
+        Write-Host "  Extraction complete (Expand-Archive)" -ForegroundColor Green
     } finally {
         if (Test-Path $tempExpand) { Remove-Item $tempExpand -Recurse -Force -ErrorAction SilentlyContinue }
     }
+}
+
+function Expand-With7zOrFallback {
+    param([string]$ZipPath, [string]$DestinationDir, [string]$MarkerPath)
+    $sevenZa = Join-Path $SevenZipDir "7za.exe"
+    if (Test-Path $sevenZa) {
+        Write-Host "  Trying 7-Zip extraction..." -ForegroundColor Cyan
+        $tempExpand = Join-Path $env:TEMP ("7zexpand_" + [guid]::NewGuid().ToString("N"))
+        New-Item -ItemType Directory -Path $tempExpand -Force | Out-Null
+        try {
+            & $sevenZa x $ZipPath -o"$tempExpand" -y | Out-Null
+            if ($LASTEXITCODE -eq 0) {
+                $markerFile = Split-Path -Leaf $MarkerPath
+                $found = Get-ChildItem -Path $tempExpand -Recurse -Filter $markerFile -ErrorAction SilentlyContinue | Select-Object -First 1
+                if ($found) {
+                    $items = @(Get-ChildItem -Path $tempExpand -Force)
+                    if ($items.Count -eq 1 -and $items[0].PSIsContainer) {
+                        $sourceDir = $items[0].FullName
+                    } else {
+                        $sourceDir = $tempExpand
+                    }
+                    if (Test-Path $DestinationDir) {
+                        Get-ChildItem -Path $DestinationDir -Force | Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
+                    } else {
+                        New-Item -ItemType Directory -Path $DestinationDir -Force | Out-Null
+                    }
+                    Copy-Item -Path (Join-Path $sourceDir '*') -Destination $DestinationDir -Recurse -Force
+                    Write-Host "  Extraction complete (7-Zip)" -ForegroundColor Green
+                    return $true
+                } else {
+                    Write-Warning "  Marker not found after 7-Zip extraction, falling back."
+                }
+            } else {
+                Write-Warning "  7-Zip extraction failed (exit code $LASTEXITCODE), falling back."
+            }
+        } catch {
+            Write-Warning "  7-Zip extraction error: $_"
+        } finally {
+            if (Test-Path $tempExpand) { Remove-Item $tempExpand -Recurse -Force -ErrorAction SilentlyContinue }
+        }
+    }
+    Expand-ZipSmart -ZipPath $ZipPath -DestinationDir $DestinationDir -MarkerPath $MarkerPath
 }
 
 function Find-GppExe {
@@ -197,37 +291,208 @@ function Find-GppExe {
     return $null
 }
 
-# ---------- 0. Download aria2 ----------
-$aria2Zip = Join-Path $RootDir "aria2.zip"
-$aria2cPath = Join-Path $Aria2Dir "aria2c.exe"
-if (-not (Test-Path $aria2cPath)) {
-    Write-Host "`n[0/3] Downloading aria2c ..." -ForegroundColor Magenta
-    $aria2Urls = @(
-        "https://github.com/aria2/aria2/releases/download/release-1.37.0/aria2-1.37.0-win-64bit-build1.zip",
-        "https://gh-proxy.com/https://github.com/aria2/aria2/releases/download/release-1.37.0/aria2-1.37.0-win-64bit-build1.zip"
+function Initialize-7Zip {
+    Write-Host "`n[7-Zip] Preparing 7-Zip..." -ForegroundColor Magenta
+    $sevenZa = Join-Path $SevenZipDir "7za.exe"
+    if (Test-Path $sevenZa) {
+        Write-Host "  7za.exe already exists, skipping." -ForegroundColor Green
+        return $true
+    }
+
+    $sevenZrUrl = "https://www.7-zip.org/a/7zr.exe"
+    $sevenZrPath = Join-Path $DownloadDir "7zr.exe"
+    if (-not (Download-WithFallback -Urls @($sevenZrUrl) -OutputPath $sevenZrPath -ExpectedHash $hashTable["7zr.exe"] -MaxRetries 5 -PreferProxy:$UseProxyFirst)) {
+        Write-Warning "7zr.exe download failed, 7-Zip will not be available."
+        return $false
+    }
+
+    $extraUrls = @(
+        "https://github.com/ip7z/7zip/releases/download/26.02/7z2602-extra.7z",
+        "https://gh-proxy.com/https://github.com/ip7z/7zip/releases/download/26.02/7z2602-extra.7z"
     )
-    Download-WithFallback -Urls $aria2Urls -OutputPath $aria2Zip -UseAria2:$false -PreferProxy:$UseProxyFirst -RetryCount $RetryCount | Out-Null
-    Expand-ZipSmart -ZipPath $aria2Zip -DestinationDir $Aria2Dir -MarkerPath "aria2c.exe"
-}
-if (-not (Test-Path $aria2cPath)) {
-    Write-Warning "aria2c not available, falling back to single-threaded downloads."
+    $extraPath = Join-Path $DownloadDir "7z2602-extra.7z"
+    if (-not (Download-WithFallback -Urls $extraUrls -OutputPath $extraPath -ExpectedHash $hashTable["7z2602-extra.7z"] -MaxRetries 5 -PreferProxy:$UseProxyFirst)) {
+        Write-Warning "7z2602-extra.7z download failed, 7-Zip will not be available."
+        return $false
+    }
+
+    $sevenZrExe = Join-Path $SevenZipDir "7zr.exe"
+    Copy-Item $sevenZrPath -Destination $sevenZrExe -Force
+
+    $tempExtract = Join-Path $env:TEMP ("7zsetup_" + [guid]::NewGuid().ToString("N"))
+    New-Item -ItemType Directory -Path $tempExtract -Force | Out-Null
+    try {
+        & $sevenZrExe x $extraPath -o"$tempExtract" -y | Out-Null
+        if ($LASTEXITCODE -eq 0) {
+            $sevenZaFromExtra = Get-ChildItem -Path $tempExtract -Recurse -Filter "7za.exe" -ErrorAction SilentlyContinue | Select-Object -First 1
+            if ($sevenZaFromExtra) {
+                Copy-Item $sevenZaFromExtra.FullName -Destination $sevenZa -Force
+                Write-Host "  7za.exe successfully installed." -ForegroundColor Green
+                return $true
+            } else {
+                Write-Warning "7za.exe not found in extra package."
+                return $false
+            }
+        } else {
+            Write-Warning "Failed to extract extra package with 7zr.exe (exit code $LASTEXITCODE)."
+            return $false
+        }
+    } catch {
+        Write-Warning "Exception during 7-Zip setup: $_"
+        return $false
+    } finally {
+        if (Test-Path $tempExtract) { Remove-Item $tempExtract -Recurse -Force -ErrorAction SilentlyContinue }
+    }
 }
 
-# ---------- 1. Download MinGW-w64 ----------
-Write-Host "`n[1/3] Downloading MinGW-w64 ..." -ForegroundColor Magenta
-$mingwZip = Join-Path $RootDir "mingw64.zip"
-$mingwUrls = @(
-    "https://github.com/brechtsanders/winlibs_mingw/releases/download/16.2.0posix-14.0.0-ucrt-r1/winlibs-x86_64-posix-seh-gcc-16.2.0-mingw-w64ucrt-14.0.0-r1.zip",
-    "https://gh-proxy.com/https://github.com/brechtsanders/winlibs_mingw/releases/download/16.2.0posix-14.0.0-ucrt-r1/winlibs-x86_64-posix-seh-gcc-16.2.0-mingw-w64ucrt-14.0.0-r1.zip"
+$resources = @(
+    @{
+        Name          = "aria2c"
+        ZipFileName   = "aria2-1.37.0-win-64bit-build1.zip"
+        ExtractDir    = $Aria2Dir
+        Marker        = "aria2c.exe"
+        Urls          = @(
+            "https://github.com/aria2/aria2/releases/download/release-1.37.0/aria2-1.37.0-win-64bit-build1.zip",
+            "https://gh-proxy.com/https://github.com/aria2/aria2/releases/download/release-1.37.0/aria2-1.37.0-win-64bit-build1.zip"
+        )
+        IsSingleFile  = $false
+        Critical      = $false
+        MaxRetries    = 5
+    },
+    @{
+        Name          = "MinGW-w64"
+        ZipFileName   = "winlibs-x86_64-posix-seh-gcc-16.2.0-mingw-w64ucrt-14.0.0-r1.zip"
+        ExtractDir    = $MingwDir
+        Marker        = "bin\g++.exe"
+        Urls          = @(
+            "https://github.com/brechtsanders/winlibs_mingw/releases/download/16.2.0posix-14.0.0-ucrt-r1/winlibs-x86_64-posix-seh-gcc-16.2.0-mingw-w64ucrt-14.0.0-r1.zip",
+            "https://gh-proxy.com/https://github.com/brechtsanders/winlibs_mingw/releases/download/16.2.0posix-14.0.0-ucrt-r1/winlibs-x86_64-posix-seh-gcc-16.2.0-mingw-w64ucrt-14.0.0-r1.zip"
+        )
+        IsSingleFile  = $false
+        Critical      = $true
+        MaxRetries    = 0
+    },
+    @{
+        Name          = "libcurl"
+        ZipFileName   = "curl-8.21.0_7-win64-mingw.zip"
+        ExtractDir    = $CurlDir
+        Marker        = "include\curl\curl.h"
+        Urls          = @(
+            "https://curl.se/windows/dl-8.21.0_7/curl-8.21.0_7-win64-mingw.zip"
+        )
+        IsSingleFile  = $false
+        Critical      = $true
+        MaxRetries    = 0
+    },
+    @{
+        Name          = "nlohmann/json"
+        ZipFileName   = "json.hpp"
+        ExtractDir    = $IncludeDir
+        Marker        = "json.hpp"
+        Urls          = @(
+            "https://github.com/nlohmann/json/releases/download/v3.11.3/json.hpp",
+            "https://gh-proxy.com/https://github.com/nlohmann/json/releases/download/v3.11.3/json.hpp"
+        )
+        IsSingleFile  = $true
+        Critical      = $true
+        MaxRetries    = 0
+    }
 )
-if (Test-FileValid $mingwZip) {
-    Write-Host "  Already exists: $mingwZip" -ForegroundColor Yellow
-} else {
-    Download-WithFallback -Urls $mingwUrls -OutputPath $mingwZip -UseAria2 -PreferProxy:$UseProxyFirst -RetryCount $RetryCount | Out-Null
+
+Write-Host "`nDownloading and verifying dependencies..." -ForegroundColor Magenta
+
+$sevenZipReady = Initialize-7Zip
+
+foreach ($res in $resources) {
+    $name = $res.Name
+    $zipFileName = $res.ZipFileName
+    $extractDir = $res.ExtractDir
+    $marker = $res.Marker
+    $urls = $res.Urls
+    $isSingle = $res.IsSingleFile
+    $critical = $res.Critical
+    $expectedHash = $hashTable[$zipFileName]
+
+    Write-Host "`n[$name] Processing..." -ForegroundColor Cyan
+
+    $downloadZip = Join-Path $DownloadDir $zipFileName
+    $rootZip = Join-Path $RootDir $zipFileName
+    $finalTarget = if ($isSingle) { Join-Path $extractDir $zipFileName } else { $extractDir }
+
+    if ($isSingle) {
+        $targetFile = Join-Path $extractDir $zipFileName
+        if (Test-FileValid $targetFile) {
+            Write-Host "  Already exists: $targetFile (skipping download and hash check)" -ForegroundColor Green
+            continue
+        }
+    } else {
+        $markerFull = Join-Path $extractDir $marker
+        if (Test-Path $markerFull) {
+            Write-Host "  Already extracted: $extractDir (skipping download and hash check)" -ForegroundColor Green
+            continue
+        }
+    }
+
+    $existingZip = $null
+    if (Test-FileValid $downloadZip) { $existingZip = $downloadZip }
+    elseif (Test-FileValid $rootZip) { $existingZip = $rootZip }
+
+    if ($existingZip) {
+        Write-Host "  Found existing archive: $existingZip" -ForegroundColor Yellow
+        if (-not (Test-Hash -Path $existingZip -ExpectedHash $expectedHash)) {
+            Write-Warning "  Hash mismatch for existing archive, will re-download."
+            Remove-Item $existingZip -Force
+            $existingZip = $null
+        } else {
+            Write-Host "  Hash verified." -ForegroundColor Green
+        }
+    }
+
+    if (-not $existingZip) {
+        $outPath = $downloadZip
+        Write-Host "  Downloading to $outPath ..." -ForegroundColor Yellow
+        $downloadArgs = @{
+            Urls          = $urls
+            OutputPath    = $outPath
+            ExpectedHash  = $expectedHash
+            UseAria2      = (-not $isSingle)
+            PreferProxy   = $UseProxyFirst
+        }
+        if ($critical) {
+            $downloadArgs['InfiniteRetry'] = $true
+        } else {
+            $downloadArgs['MaxRetries'] = 5
+        }
+        $downloadSuccess = Download-WithFallback @downloadArgs
+        if (-not $downloadSuccess) {
+            if ($critical) {
+                Write-Error "Critical resource $name failed to download. Aborting."
+                exit 1
+            } else {
+                Write-Warning "Non-critical resource $name failed to download. Skipping."
+                continue
+            }
+        }
+        $existingZip = $outPath
+    }
+
+    if ($isSingle) {
+        Copy-Item $existingZip -Destination $finalTarget -Force
+        Write-Host "  Copied $zipFileName to $finalTarget" -ForegroundColor Green
+    } else {
+        Expand-With7zOrFallback -ZipPath $existingZip -DestinationDir $finalTarget -MarkerPath $marker | Out-Null
+    }
+
+    Write-Host "[$name] Done." -ForegroundColor Green
 }
-if (-not (Test-Path (Join-Path $MingwDir "bin\g++.exe"))) {
-    Expand-ZipSmart -ZipPath $mingwZip -DestinationDir $MingwDir -MarkerPath "bin\g++.exe"
+
+Write-Host "`nVerifying tools..." -ForegroundColor Magenta
+
+$aria2cPath = Join-Path $Aria2Dir "aria2c.exe"
+if (-not (Test-Path $aria2cPath)) {
+    Write-Warning "aria2c not available, falling back to single-threaded downloads (already handled)."
 }
+
 $gppExe = Find-GppExe
 if (-not $gppExe) { throw "g++.exe not found after MinGW extraction" }
 $mingwBin = Join-Path $MingwDir "bin"
@@ -238,37 +503,13 @@ if (-not (Test-Path $mingwBin) -or -not (Test-Path $mingwInclude) -or -not (Test
 }
 Write-Host "  g++.exe located at: $gppExe" -ForegroundColor Green
 
-# ---------- 2. Download libcurl ----------
-Write-Host "`n[2/3] Downloading libcurl ..." -ForegroundColor Magenta
-$curlZip = Join-Path $RootDir "libcurl.zip"
-$curlUrl = "https://curl.se/windows/dl-8.21.0_7/curl-8.21.0_7-win64-mingw.zip"
-if (Test-FileValid $curlZip) {
-    Write-Host "  Already exists: $curlZip" -ForegroundColor Yellow
-} else {
-    Download-WithFallback -Urls @($curlUrl) -OutputPath $curlZip -UseAria2:$false -PreferProxy:$UseProxyFirst -RetryCount $RetryCount | Out-Null
-}
-if (-not (Test-Path (Join-Path $CurlDir "include\curl\curl.h"))) {
-    Expand-ZipSmart -ZipPath $curlZip -DestinationDir $CurlDir -MarkerPath "include\curl\curl.h"
-}
 if (-not (Test-Path (Join-Path $CurlDir "include\curl\curl.h"))) {
     throw "libcurl header not found after extraction"
 }
 
-# ---------- 3. Download nlohmann/json header ----------
-Write-Host "`n[3/3] Downloading nlohmann/json.hpp ..." -ForegroundColor Magenta
 $jsonHpp = Join-Path $IncludeDir "json.hpp"
-$jsonUrls = @(
-    "https://github.com/nlohmann/json/releases/download/v3.11.3/json.hpp",
-    "https://gh-proxy.com/https://github.com/nlohmann/json/releases/download/v3.11.3/json.hpp"
-)
-if (Test-FileValid $jsonHpp) {
-    Write-Host "  Already exists: $jsonHpp" -ForegroundColor Yellow
-} else {
-    Download-WithFallback -Urls $jsonUrls -OutputPath $jsonHpp -UseAria2:$false -PreferProxy:$UseProxyFirst -RetryCount $RetryCount | Out-Null
-}
-if (-not (Test-FileValid $jsonHpp)) { throw "json.hpp download failed" }
+if (-not (Test-FileValid $jsonHpp)) { throw "json.hpp not found" }
 
-# ---------- Write C++ source code ----------
 Write-Host "`nWriting crawler.cpp ..." -ForegroundColor Magenta
 $cppSource = @'
 /** @file crawler.cpp
@@ -345,12 +586,11 @@ int g_startId = 1;
 int g_endId = 10000;
 int g_threadCount = 4;
 int g_requestIntervalMs = 50;
-int g_retryCount = 3;       // Retry count for each HTTP request
+int g_retryCount = 3;
 const std::string OUTPUT_FILE = "data.json";
 
 std::atomic<bool> g_interrupted{false};
 
-/// @brief Remove HTML tags, keep plain text
 std::string stripHtml(const std::string& input) {
     std::string result;
     bool inTag = false;
@@ -362,7 +602,6 @@ std::string stripHtml(const std::string& input) {
     return result;
 }
 
-/// @brief Find matching closing tag position (simple nested handling)
 size_t findMatchingCloseTag(const std::string& html, size_t openTagEndPos, const std::string& tagName) {
     size_t pos = openTagEndPos;
     int depth = 1;
@@ -389,7 +628,6 @@ size_t findMatchingCloseTag(const std::string& html, size_t openTagEndPos, const
     return std::string::npos;
 }
 
-/// @brief Extract entire HTML fragment including the start tag
 std::string extractOuterHtml(const std::string& html, size_t tagStartPos, const std::string& tagName) {
     size_t tagEnd = html.find('>', tagStartPos);
     if (tagEnd == std::string::npos) return "";
@@ -398,7 +636,6 @@ std::string extractOuterHtml(const std::string& html, size_t tagStartPos, const 
     return html.substr(tagStartPos, closePos - tagStartPos + tagName.size() + 3);
 }
 
-/// @brief Extract inner HTML of a tag (excluding the tag itself)
 std::string extractInnerHtml(const std::string& html, size_t tagStartPos, const std::string& tagName) {
     size_t tagEnd = html.find('>', tagStartPos);
     if (tagEnd == std::string::npos) return "";
@@ -407,14 +644,12 @@ std::string extractInnerHtml(const std::string& html, size_t tagStartPos, const 
     return html.substr(tagEnd + 1, closePos - tagEnd - 1);
 }
 
-/// @brief libcurl write callback
 static size_t WriteCallback(void* contents, size_t size, size_t nmemb, std::string* output) {
     size_t total = size * nmemb;
     output->append((char*)contents, total);
     return total;
 }
 
-/// @brief Fetch URL content, return HTTP status code and response body
 std::pair<long, std::string> fetchUrl(const std::string& url) {
     CURL* curl = curl_easy_init();
     std::string response;
@@ -438,7 +673,6 @@ std::pair<long, std::string> fetchUrl(const std::string& url) {
     return {http_code, response};
 }
 
-/// @brief Parse card page
 json parseCardPage(const std::string& html) {
     json card;
     const std::string marker = "<div class=\"wireframe format\">";
@@ -488,7 +722,6 @@ json parseCardPage(const std::string& html) {
     return card;
 }
 
-/// @brief Parse command line arguments
 void parseCommandLine(int argc, char* argv[]) {
     for (int i = 1; i < argc; ++i) {
         std::string arg = argv[i];
@@ -552,7 +785,6 @@ void parseCommandLine(int argc, char* argv[]) {
     if (g_endId < g_startId) { std::swap(g_startId, g_endId); }
 }
 
-/// @brief Console signal handler (Ctrl+C)
 BOOL WINAPI ConsoleCtrlHandler(DWORD ctrlType) {
     if (ctrlType == CTRL_C_EVENT || ctrlType == CTRL_BREAK_EVENT) {
         g_interrupted.store(true);
@@ -591,7 +823,6 @@ int main(int argc, char* argv[]) {
             std::string html;
             long statusCode = 0;
 
-            // Retry loop for each request
             for (int attempt = 0; attempt < g_retryCount && !success; ++attempt) {
                 auto [code, body] = fetchUrl(url);
                 statusCode = code;
@@ -599,7 +830,6 @@ int main(int argc, char* argv[]) {
                 if (statusCode == 200) {
                     success = true;
                 } else {
-                    // Log retry (except last attempt)
                     if (attempt < g_retryCount - 1) {
                         std::lock_guard<std::mutex> lock(printMutex);
                         std::cout << "ID " << id << " : HTTP " << statusCode << " (attempt " << (attempt+1) << "/" << g_retryCount << "), retrying..." << std::endl;
@@ -642,7 +872,6 @@ int main(int argc, char* argv[]) {
     for (int i = 0; i < g_threadCount; ++i) threads.emplace_back(worker);
     for (auto& t : threads) t.join();
 
-    // Sort by card ID
     std::sort(allCards.begin(), allCards.end(), [](const json& a, const json& b) {
         std::string idA = a.value("\u5361\u7247ID", "0");
         std::string idB = b.value("\u5361\u7247ID", "0");
@@ -669,21 +898,17 @@ int main(int argc, char* argv[]) {
 }
 '@
 
-# Replace version placeholder
 $cppSource = $cppSource.Replace('__VERSION__', $Version)
-Set-Content -Path "crawler.cpp" -Value $cppSource -Encoding ASCII
+Set-Content -Path "crawler.cpp" -Value $cppSource -Encoding UTF8
 
-# ---------- Compile ----------
 Write-Host "`nCompiling crawler.cpp ..." -ForegroundColor Magenta
-$gppExe = Find-GppExe
 $curlInclude = Join-Path $CurlDir "include"
 $curlLib = Join-Path $CurlDir "lib"
-$includeDir = $IncludeDir
 $compileArgs = @(
     "-std=c++17",
     "-O2",
     "-I", $curlInclude,
-    "-I", $includeDir,
+    "-I", $IncludeDir,
     "-L", $curlLib,
     "crawler.cpp",
     "-o", "crawler.exe",
@@ -699,7 +924,6 @@ if ($LASTEXITCODE -ne 0) {
     exit 1
 }
 
-# ---------- Copy required DLLs ----------
 Write-Host "`nCopying required DLLs to script directory..." -ForegroundColor Magenta
 $exeDir = $RootDir
 
@@ -723,7 +947,6 @@ foreach ($dll in $runtimeDlls) {
     }
 }
 
-# ---------- Test run ----------
 Write-Host "`nTesting crawler.exe --version ..." -ForegroundColor Magenta
 & "$exeDir\crawler.exe" --version
 if ($LASTEXITCODE -eq 0) {
